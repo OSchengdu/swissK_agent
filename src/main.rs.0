@@ -1,0 +1,367 @@
+use crossterm::{
+    event::{self, Event, KeyCode, KeyModifiers},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    ExecutableCommand,
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
+    Terminal,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::fs::OpenOptions;
+use std::io::{self, BufRead, Write};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
+use std::time::Duration;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Text,
+    Image,
+    Rag,
+    Agent,
+}
+
+impl Mode {
+    fn next(&mut self) {
+        *self = match self {
+            Mode::Text => Mode::Image,
+            Mode::Image => Mode::Rag,
+            Mode::Rag => Mode::Agent,
+            Mode::Agent => Mode::Text,
+        };
+    }
+    fn as_str(&self) -> &'static str {
+        match self {
+            Mode::Text => "text",
+            Mode::Image => "image",
+            Mode::Rag => "rag",
+            Mode::Agent => "agent",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct OllamaRequest {
+    model: String,
+    prompt: String,
+    stream: bool,
+}
+
+#[derive(Deserialize)]
+struct OllamaStreamResponse {
+    response: Option<String>,
+    done: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+struct Message {
+    input: String,
+    output: String,
+}
+
+struct App {
+    mode: Mode,
+    session: String,
+    input: String,
+    history: Vec<Message>,
+    show_history: bool,
+    tx: Sender<Task>,
+    rx: Receiver<String>,
+    rag_loaded: bool,
+    waiting: bool,
+}
+
+#[derive(Clone)]
+enum Task {
+    Query(String, Mode),
+}
+
+impl App {
+    fn new() -> Self {
+        let (tx, task_rx) = mpsc::channel();
+        let (resp_tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(300))
+                .build()
+                .unwrap_or_else(|_| reqwest::blocking::Client::new());
+
+            for task in task_rx {
+                match task {
+                    Task::Query(prompt, mode) => {
+                        let (model, final_prompt) = match mode {
+                            Mode::Text => ("qwen3:8b".to_string(), prompt.clone()),
+                            Mode::Image => {
+                                if prompt.starts_with("image:") {
+                                    ("qwen-vl:8b".to_string(), prompt.clone())
+                                } else {
+                                    resp_tx.send("Image mode: use 'image:/path'".to_string()).ok();
+                                    continue;
+                                }
+                            }
+                            Mode::Rag => {
+                                if prompt.starts_with("rag:load ") {
+                                    resp_tx.send("RAG doc loaded (simulated).".to_string()).ok();
+                                    continue;
+                                }
+                                ("qwen3:8b".to_string(), format!("[RAG] {}", prompt))
+                            }
+                            Mode::Agent => ("qwen3:8b".to_string(), format!("[Agent] {}", prompt)),
+                        };
+
+                        let req = json!({
+                            "model": model,
+                            "prompt": final_prompt,
+                            "stream": true  // 切换到流式，避免 OOM
+                        });
+
+                        let mut result = String::new();
+                        let mut has_error = false;
+
+                        match client.post("http://127.0.0.1:11434/api/generate").json(&req).send() {
+                            Ok(response) if response.status().is_success() => {
+                                if let Ok(lines) = response.bytes() {
+                                    for line in lines.lines() {
+                                        if let Ok(line_str) = line {
+                                            if let Ok(stream_resp) = serde_json::from_str::<OllamaStreamResponse>(&line_str) {
+                                                if let Some(text) = stream_resp.response {
+                                                    result.push_str(&text);
+                                                }
+                                                if let Some(err) = stream_resp.error {
+                                                    result = format!("Error: {}", err);
+                                                    has_error = true;
+                                                    break;
+                                                }
+                                                if stream_resp.done {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(response) => {
+                                result = format!("HTTP Error: {}", response.status());
+                                has_error = true;
+                            }
+                            Err(e) => {
+                                result = format!("Request Error: {}", e);
+                                has_error = true;
+                            }
+                        }
+
+                        if !has_error {
+                            result = result.trim().to_string();
+                        }
+                        resp_tx.send(result).ok();
+                    }
+                }
+            }
+        });
+
+        Self {
+            mode: Mode::Text,
+            session: "default".to_string(),
+            input: String::new(),
+            history: vec![],
+            show_history: false,
+            tx,
+            rx,
+            rag_loaded: false,
+            waiting: false,
+        }
+    }
+
+    fn send(&mut self) {
+        if self.input.trim().is_empty() {
+            return;
+        }
+
+        let input = self.input.drain(..).collect::<String>();
+        let task = if input.starts_with("rag:load ") {
+            self.rag_loaded = true;
+            Task::Query(input.clone(), self.mode)
+        } else {
+            Task::Query(input.clone(), self.mode)
+        };
+
+        self.tx.send(task).ok();
+        self.waiting = true;
+        self.history.push(Message {
+            input: input.clone(),
+            output: "...".to_string(),
+        });
+    }
+
+    fn save_to_json(&self, response: &str) {
+        let filename = if self.mode == Mode::Image {
+            format!("{}.media.json", self.session)
+        } else {
+            format!("{}.chat.json", self.session)
+        };
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(filename) {
+            let data = json!({
+                "input": self.history.last().map(|m| &m.input).unwrap_or(&"".to_string()),
+                "output": response,
+                "mode": self.mode.as_str()
+            });
+            writeln!(f, "{}", data).ok();
+        }
+    }
+
+    fn quote(&self, idx: usize) -> Option<&str> {
+        if idx == 0 || idx > self.history.len() {
+            None
+        } else {
+            Some(&self.history[self.history.len() - idx].output)
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    stdout.execute(EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut app = App::new();
+
+    loop {
+        // 接收后台响应
+        if let Ok(resp) = app.rx.try_recv() {
+            if let Some(last) = app.history.last_mut() {
+                last.output = resp.clone();
+            }
+            app.save_to_json(&resp);
+            app.waiting = false;
+        }
+
+        terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(3),
+                ])
+                .split(f.size());
+
+            // Header
+            let mut header_spans = vec![
+                Span::styled(" Ollama TUI ", Style::default().fg(Color::Yellow)),
+                Span::raw(" | "),
+                Span::styled(format!("Mode: {}", app.mode.as_str()), Style::default().fg(Color::Green)),
+                Span::raw(" | "),
+                Span::styled(format!("Session: {}", app.session), Style::default().fg(Color::Cyan)),
+            ];
+            if app.waiting {
+                header_spans.push(Span::raw(" [thinking...]").style(Style::default().fg(Color::Red)));
+            }
+            let header = Line::from(header_spans);
+            f.render_widget(Paragraph::new(header), chunks[0]);
+
+            // Body
+            if app.show_history {
+                let items: Vec<ListItem> = app.history.iter().rev().enumerate().map(|(i, m)| {
+                    ListItem::new(format!("{}: {} → {}", i + 1, m.input, m.output))
+                }).collect();
+                f.render_widget(
+                    List::new(items).block(Block::default().borders(Borders::ALL).title("History Stack")),
+                    chunks[1],
+                );
+            } else {
+                let log = if app.history.is_empty() {
+                    "No messages yet.".to_string()
+                } else {
+                    let last = app.history.last().unwrap();
+                    format!("> {}\n{}", last.input, last.output)
+                };
+                f.render_widget(
+                    Paragraph::new(log).block(Block::default().borders(Borders::ALL)),
+                    chunks[1],
+                );
+            }
+
+            // Input
+            let input = Paragraph::new(app.input.as_str())
+                .style(Style::default().fg(Color::Yellow))
+                .block(Block::default().borders(Borders::ALL).title("Input | Ctrl+M=Mode | Ctrl+S=Session | Ctrl+H=History | Ctrl+Q=Quit"));
+            f.render_widget(input, chunks[2]);
+        })?;
+
+        if let Event::Key(key) = event::read()? {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('m') => app.mode.next(),
+                    KeyCode::Char('s') => {
+                        // 切换会话
+                        let mut new_session = String::new();
+                        terminal.draw(|f| {
+                            f.render_widget(
+                                Paragraph::new("Enter new session name:").block(Block::default().borders(Borders::ALL)),
+                                f.size(),
+                            );
+                        })?;
+                        loop {
+                            if let Event::Key(k) = event::read()? {
+                                match k.code {
+                                    KeyCode::Enter => break,
+                                    KeyCode::Char(c) => new_session.push(c),
+                                    KeyCode::Backspace => { new_session.pop(); }
+                                    _ => {}
+                                }
+                                terminal.draw(|f| {
+                                    f.render_widget(
+                                        Paragraph::new(format!("Session: {}", new_session)).block(Block::default().borders(Borders::ALL)),
+                                        f.size(),
+                                    );
+                                })?;
+                            }
+                        }
+                        if new_session.trim().is_empty() {
+                            new_session = "default".to_string();
+                        } else {
+                            new_session = new_session.trim().to_string();
+                        }
+                        app.session = new_session;
+                    }
+                    KeyCode::Char('h') => app.show_history = !app.show_history,
+                    KeyCode::Char('q') => break,
+                    _ => {}
+                }
+                continue;
+            }
+
+            match key.code {
+                KeyCode::Enter => {
+                    if app.input.starts_with("quote:") {
+                        if let Ok(idx) = app.input[6..].trim().parse::<usize>() {
+                            if let Some(quote) = app.quote(idx) {
+                                app.input = format!("(quoted) {}", quote);
+                            }
+                        }
+                    } else if !app.waiting {
+                        app.send();
+                    }
+                }
+                KeyCode::Char(c) => app.input.push(c),
+                KeyCode::Backspace => { app.input.pop(); }
+                KeyCode::Esc => app.input.clear(),
+                _ => {}
+            }
+        }
+    }
+
+    disable_raw_mode()?;
+    io::stdout().execute(LeaveAlternateScreen)?;
+    Ok(())
+}
